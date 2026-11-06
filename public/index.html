@@ -63,7 +63,9 @@
   td.act button{border:0;background:none;color:var(--bad);cursor:pointer;font-size:16px;padding:4px 8px}
   #planner td:nth-child(1) select{min-width:150px} #planner td:nth-child(2) input{min-width:210px} #planner td:nth-child(3) select{min-width:100px}
   #planner td:nth-child(4) select{min-width:170px} #planner td:nth-child(5) select{min-width:180px} #planner td:nth-child(15) input{min-width:200px}
-  #suppliers td input{min-width:150px}
+  #suppliers td input,#catalog td input,#rooms td input{min-width:150px}
+  #catalog td select,#rooms td select{min-width:130px}
+  td.act .btn{white-space:nowrap}
   .hint{color:var(--muted);margin:0 0 10px;font-size:13px}
   .note{background:var(--warn-bg);color:var(--warn-fg);padding:8px 12px;border-radius:6px;margin-bottom:10px;font-size:13px}
   .empty{padding:28px 16px;text-align:center;color:var(--muted)}
@@ -98,6 +100,8 @@
 
   <div class="bar" role="tablist">
     <button class="tab" role="tab" id="tabPlanner" data-tab="planner" aria-selected="true">Furniture Budget</button>
+    <button class="tab" role="tab" id="tabCatalog" data-tab="catalog" aria-selected="false">Items List</button>
+    <button class="tab" role="tab" id="tabRooms" data-tab="rooms" aria-selected="false">Rooms</button>
     <button class="tab" role="tab" id="tabSuppliers" data-tab="suppliers" aria-selected="false">Suppliers</button>
     <span class="grow"></span>
     <button class="btn" id="btnCsv">Export CSV</button>
@@ -116,6 +120,18 @@
     <div class="wrap"><table id="planner"></table></div>
   </section>
 
+  <section id="catalogView" hidden>
+    <p class="hint">List the furniture you may need, once each, with its usual room and priority. In the planner, typing an item name suggests these and fills in the room and priority. Use "Add to planner" to put an item on your budget list.</p>
+    <div class="tools"><button class="btn primary" id="addCat">+ Add item</button></div>
+    <div class="wrap"><table id="catalog"></table></div>
+  </section>
+
+  <section id="roomsView" hidden>
+    <p class="hint">List your rooms. They fill the Room dropdown in the planner. Set a room budget to see how much of it is left. Grey columns are calculated.</p>
+    <div class="tools"><button class="btn primary" id="addRoom">+ Add room</button></div>
+    <div class="wrap"><table id="rooms"></table></div>
+  </section>
+
   <section id="suppliersView" hidden>
     <p class="hint">Add each shop, supplier or carpenter once. They appear in the Supplier / Store dropdown and their details fill in on every item. Grey columns are calculated.</p>
     <div class="tools"><button class="btn primary" id="addSup">+ Add supplier</button></div>
@@ -127,6 +143,7 @@
 
 <div id="modal" class="modal" hidden><div class="box"><p id="modalMsg"></p><div class="row"><button class="btn" id="modalNo">Cancel</button><button class="btn danger" id="modalYes">OK</button></div></div></div>
 
+<datalist id="catalogList"></datalist>
 <div id="lock" class="lock" hidden><form class="box" id="lockForm"><h2>Furniture Budget Planner</h2><p>Enter your PIN to open the planner.</p><input id="pinIn" type="password" inputmode="numeric" autocomplete="current-password" aria-label="PIN"><div class="err" id="lockErr" role="alert"></div><button class="btn primary" type="submit" style="width:100%">Open</button></form></div>
 <script>
 (function(){
@@ -164,10 +181,27 @@ function clone(o){return JSON.parse(JSON.stringify(o));}
 function canon(o){ if(Array.isArray(o))return "["+o.map(canon).join(",")+"]"; if(o&&typeof o==="object")return "{"+Object.keys(o).sort().map(function(k){return JSON.stringify(k)+":"+canon(o[k]);}).join(",")+"}"; return JSON.stringify(o); }
 
 /* ---------- state + persistence (Netlify Function + Blobs) ---------- */
-var state={budget:0,suppliers:[],items:defaultItems()};
+function roomsFrom(items){
+  var names=ROOMS.slice(); items.forEach(function(i){if(i.room&&names.indexOf(i.room)<0)names.push(i.room);});
+  return names.map(function(n){return {id:"r:"+n,name:n,size:"",budget:"",notes:""};});
+}
+function catalogFrom(items){
+  var seen={},out=[]; items.forEach(function(i){var k=(i.item||"").trim().toLowerCase(); if(k&&!seen[k]){seen[k]=1;out.push({id:"c:"+k,name:i.item.trim(),room:i.room,priority:i.priority,notes:""});}});
+  return out;
+}
+function normalize(d){
+  var o={budget:num(d.budget),suppliers:Array.isArray(d.suppliers)?d.suppliers:[],items:Array.isArray(d.items)?d.items:[]};
+  o.rooms=Array.isArray(d.rooms)?d.rooms:roomsFrom(o.items);
+  o.catalog=Array.isArray(d.catalog)?d.catalog:catalogFrom(o.items);
+  return o;
+}
+var state=normalize({budget:0,suppliers:[],items:defaultItems()});
+function roomNames(){return state.rooms.map(function(r){return r.name;}).filter(function(n){return n&&n.trim();});}
+function newRoom(){return {id:newId(),name:"",size:"",budget:"",notes:""};}
+function newCat(){return {id:newId(),name:"",room:roomNames()[0]||"General",priority:"Medium",notes:""};}
 var PIN=""; try{PIN=localStorage.getItem("fbp_pin")||"";}catch(e){}
 var loaded=false, writing=false, dirty=false, wtimer=null;
-function plain(){return {budget:num(state.budget),suppliers:state.suppliers,items:state.items};}
+function plain(){return {budget:num(state.budget),suppliers:state.suppliers,items:state.items,rooms:state.rooms,catalog:state.catalog};}
 function supById(id){for(var i=0;i<state.suppliers.length;i++)if(state.suppliers[i].id===id)return state.suppliers[i];return null;}
 function setStatus(kind,text){var s=$("status");s.textContent=text;s.className=kind||"";}
 function api(method,body){
@@ -186,9 +220,9 @@ function flush(){
 }
 function applyRemote(data){
   if(!data||!Array.isArray(data.items)||!Array.isArray(data.suppliers))return;
-  var next={budget:num(data.budget),suppliers:data.suppliers,items:data.items};
-  if(canon(next)===canon({budget:num(state.budget),suppliers:state.suppliers,items:state.items}))return;
-  state=next; $("budget").value=state.budget||0; fillRoomFilter(); renderCurrent(); updateTotals();
+  var next=normalize(data);
+  if(canon(next)===canon(plain()))return;
+  state=next; $("budget").value=state.budget||0; fillRoomFilter(); refreshCatalogList(); renderCurrent(); updateTotals();
 }
 function showLock(msg){ $("lock").hidden=false; $("lockErr").textContent=msg||""; $("pinIn").value=""; $("pinIn").focus(); }
 function load(first){
@@ -253,8 +287,12 @@ function renderPlanner(){
     if(q && (it.item+" "+(s?s.name:"")).toLowerCase().indexOf(q)<0) return;
     shown++;
     var tr=el("tr");
-    tr.appendChild(cell(selectEl(ROOMS,it.room,function(v){it.room=v;fillRoomFilter();touch();})));
-    tr.appendChild(cell(textIn(it.item,function(v){it.item=v;touch();},"text","Item")));
+    tr.appendChild(cell(selectEl(roomNames(),it.room,function(v){it.room=v;fillRoomFilter();touch();})));
+    var nameIn0=textIn(it.item,function(v){it.item=v;touch();},"text","Item"); nameIn0.setAttribute("list","catalogList");
+    nameIn0.addEventListener("change",function(){
+      var c=catByName(nameIn0.value); if(c){it.item=c.name; if(c.room)it.room=c.room; if(c.priority)it.priority=c.priority; touch(); fillRoomFilter(); renderPlanner(); updateTotals();}
+    });
+    tr.appendChild(cell(nameIn0));
     tr.appendChild(cell(selectEl(PRIORITY,it.priority,function(v){it.priority=v;touch();})));
     tr.appendChild(cell(selectEl(WHERE,it.where,function(v){it.where=v;touch();},"")));
     var opts=state.suppliers.filter(function(x){return x.name.trim();}).map(function(x){return {v:x.id,t:x.name};});
@@ -282,7 +320,7 @@ function updateTotals(){
   var est=0,act=0; state.items.forEach(function(i){est+=num(i.est);act+=num(i.actual);});
   $("sumEst").textContent=fmt(est); $("sumAct").textContent=fmt(act);
   var rem=num(state.budget)-act, e=$("sumRem"); e.textContent=fmt(rem); e.className="v "+(rem<0?"bad":"good");
-  updateSupplierStats();
+  updateSupplierStats(); updateRoomStats(); updateCatStats();
 }
 
 /* ---------- suppliers table ---------- */
@@ -325,18 +363,96 @@ function updateSupplierStats(){
   });
 }
 
+/* ---------- items list (catalog) ---------- */
+function catByName(n){n=(n||"").trim().toLowerCase(); if(!n)return null; for(var i=0;i<state.catalog.length;i++)if(state.catalog[i].name.trim().toLowerCase()===n)return state.catalog[i]; return null;}
+function refreshCatalogList(){
+  var d=$("catalogList"); d.innerHTML=""; state.catalog.forEach(function(c){ if(c.name.trim())d.appendChild(el("option",{value:c.name})); });
+}
+var CCOLS=["Item Name","Usual Room","Priority","Notes","In Planner",""];
+var catCells={};
+function renderCatalog(){
+  var t=$("catalog"); t.innerHTML=""; catCells={};
+  var thead=el("thead"),hr=el("tr"); CCOLS.forEach(function(c){hr.appendChild(el("th",{text:c}));}); thead.appendChild(hr); t.appendChild(thead);
+  var tb=el("tbody");
+  state.catalog.forEach(function(c){
+    var tr=el("tr");
+    tr.appendChild(cell(textIn(c.name,function(v){c.name=v;refreshCatalogList();touch();},"text","Item name")));
+    tr.appendChild(cell(selectEl(roomNames(),c.room,function(v){c.room=v;touch();})));
+    tr.appendChild(cell(selectEl(PRIORITY,c.priority,function(v){c.priority=v;touch();})));
+    tr.appendChild(cell(textIn(c.notes,function(v){c.notes=v;touch();},"text","Notes")));
+    var cnt=el("td",{class:"auto"}); catCells[c.id]=cnt; tr.appendChild(cnt);
+    var add=el("button",{class:"btn",text:"+ Add to planner",title:"Add this item to the Furniture Budget list"});
+    add.addEventListener("click",function(){
+      if(!c.name.trim()){toast("Give the item a name first");return;}
+      state.items.push(newItem(c.room,c.name.trim(),c.priority)); touch(); fillRoomFilter(); updateTotals(); toast("Added to the planner");
+    });
+    var del=el("button",{title:"Delete item","aria-label":"Delete item",text:"\u2715"});
+    del.addEventListener("click",function(){ask("Delete \""+(c.name||"this item")+"\" from the items list? Rows already in the planner stay.","Delete").then(function(ok){if(!ok)return;state.catalog=state.catalog.filter(function(x){return x!==c;});touch();refreshCatalogList();renderCatalog();});});
+    var td=el("td",{class:"act"}); td.appendChild(add); td.appendChild(del); tr.appendChild(td);
+    tb.appendChild(tr);
+  });
+  if(!state.catalog.length){var r=el("tr");r.appendChild(el("td",{class:"empty",colspan:String(CCOLS.length),text:"No items yet. Use + Add item to build your list."}));tb.appendChild(r);}
+  t.appendChild(tb); updateCatStats();
+}
+function updateCatStats(){
+  state.catalog.forEach(function(c){var x=catCells[c.id]; if(!x)return; var k=c.name.trim().toLowerCase(),n=0;
+    if(k)state.items.forEach(function(i){if((i.item||"").trim().toLowerCase()===k)n++;}); x.textContent=n;});
+}
+
+/* ---------- rooms ---------- */
+var RCOLS=["Room Name","Size (m\u00b2)","Room Budget (ETB)","Notes","Items","Estimated (ETB)","Actual (ETB)","Budget Left (ETB)",""];
+var roomCells={};
+function renderRooms(){
+  var t=$("rooms"); t.innerHTML=""; roomCells={};
+  var thead=el("thead"),hr=el("tr"); RCOLS.forEach(function(c){hr.appendChild(el("th",{text:c}));}); thead.appendChild(hr); t.appendChild(thead);
+  var tb=el("tbody");
+  state.rooms.forEach(function(r){
+    var tr=el("tr"), prev=r.name;
+    var nameIn=textIn(r.name,function(v){r.name=v;touch();},"text","Room name");
+    nameIn.addEventListener("change",function(){
+      var now=r.name; if(prev&&now&&prev!==now){
+        state.items.forEach(function(i){if(i.room===prev)i.room=now;}); state.catalog.forEach(function(c){if(c.room===prev)c.room=now;}); touch();
+      }
+      prev=now; fillRoomFilter(); updateTotals();
+    });
+    tr.appendChild(cell(nameIn));
+    tr.appendChild(cell(textIn(r.size,function(v){r.size=v;touch();},"number","Size"),"num"));
+    tr.appendChild(cell(textIn(r.budget,function(v){r.budget=v;updateRoomStats();touch();},"number","Room budget"),"num"));
+    tr.appendChild(cell(textIn(r.notes,function(v){r.notes=v;touch();},"text","Notes")));
+    var cs=[el("td",{class:"auto"}),el("td",{class:"auto"}),el("td",{class:"auto"}),el("td",{class:"auto"})]; roomCells[r.id]=cs; cs.forEach(function(c){tr.appendChild(c);});
+    var del=el("button",{title:"Delete room","aria-label":"Delete room",text:"\u2715"});
+    del.addEventListener("click",function(){
+      var n=state.items.filter(function(i){return i.room===r.name;}).length;
+      ask(n?("This room has "+n+" item(s) in the planner. They keep the room name but it will no longer be in the dropdown. Delete the room?"):"Delete this room?","Delete").then(function(ok){
+        if(!ok)return; state.rooms=state.rooms.filter(function(x){return x!==r;}); touch(); fillRoomFilter(); renderRooms(); updateTotals();
+      });
+    });
+    tr.appendChild(cell(del,"act")); tb.appendChild(tr);
+  });
+  if(!state.rooms.length){var r0=el("tr");r0.appendChild(el("td",{class:"empty",colspan:String(RCOLS.length),text:"No rooms yet. Use + Add room."}));tb.appendChild(r0);}
+  t.appendChild(tb); updateRoomStats();
+}
+function updateRoomStats(){
+  state.rooms.forEach(function(r){
+    var c=roomCells[r.id]; if(!c)return; var n=0,e=0,a=0;
+    state.items.forEach(function(i){if(i.room===r.name&&r.name){n++;e+=num(i.est);a+=num(i.actual);}});
+    c[0].textContent=n; c[1].textContent=fmt(e); c[2].textContent=fmt(a);
+    if(num(r.budget)>0){var left=num(r.budget)-a; c[3].textContent=fmt(left); c[3].style.color=left<0?"var(--bad)":"var(--good)";} else {c[3].textContent=""; c[3].style.color="";}
+  });
+}
+
 /* ---------- tabs, filters, export ---------- */
 var tab="planner";
+var TABS={planner:"tabPlanner",catalog:"tabCatalog",rooms:"tabRooms",suppliers:"tabSuppliers"};
 function showTab(name){
   tab=name;
-  ["planner","suppliers"].forEach(function(n){ $("tab"+n[0].toUpperCase()+n.slice(1)).setAttribute("aria-selected",n===name?"true":"false"); });
-  $("plannerView").hidden=name!=="planner"; $("suppliersView").hidden=name!=="suppliers";
+  Object.keys(TABS).forEach(function(n){ $(TABS[n]).setAttribute("aria-selected",n===name?"true":"false"); $(n+"View").hidden=n!==name; });
   renderCurrent();
 }
-function renderCurrent(){ if(tab==="planner")renderPlanner(); else renderSuppliers(); }
+function renderCurrent(){ ({planner:renderPlanner,catalog:renderCatalog,rooms:renderRooms,suppliers:renderSuppliers})[tab](); }
 function fillRoomFilter(){
   var f=$("roomFilter"),cur=f.value; f.innerHTML=""; f.appendChild(el("option",{value:"",text:"All rooms"}));
-  var seen={}; ROOMS.concat(state.items.map(function(i){return i.room;})).forEach(function(r){if(r&&!seen[r]){seen[r]=1;f.appendChild(el("option",{value:r,text:r}));}});
+  var seen={}; roomNames().concat(state.items.map(function(i){return i.room;})).forEach(function(r){if(r&&!seen[r]){seen[r]=1;f.appendChild(el("option",{value:r,text:r}));}});
   f.value=cur;
 }
 function csvCell(v){v=String(v==null?"":v);return /[",\n]/.test(v)?'"'+v.replace(/"/g,'""')+'"':v;}
@@ -364,6 +480,14 @@ $("addSup").addEventListener("click",function(){
   state.suppliers.push(newSupplier()); touch(); renderSuppliers();
   var rows=document.querySelectorAll("#suppliers tbody tr"); if(rows.length){rows[rows.length-1].querySelector("input").focus();}
 });
+$("addCat").addEventListener("click",function(){
+  state.catalog.push(newCat()); touch(); renderCatalog();
+  var rows=document.querySelectorAll("#catalog tbody tr"); if(rows.length){rows[rows.length-1].querySelector("input").focus();}
+});
+$("addRoom").addEventListener("click",function(){
+  state.rooms.push(newRoom()); touch(); renderRooms();
+  var rows=document.querySelectorAll("#rooms tbody tr"); if(rows.length){rows[rows.length-1].querySelector("input").focus();}
+});
 $("roomFilter").addEventListener("change",renderPlanner);
 $("search").addEventListener("input",renderPlanner);
 $("btnCsv").addEventListener("click",function(){saveFile("furniture_budget.csv",csvText(),"text/csv");});
@@ -374,13 +498,13 @@ $("fileIn").addEventListener("change",function(){
   r.onload=function(){
     var s; try{s=JSON.parse(r.result); if(!s||!Array.isArray(s.items)||!Array.isArray(s.suppliers))throw 0;}catch(e){toast("That file is not a valid planner backup.");return;}
     ask("Replace everything in the planner with this backup?","Replace").then(function(ok){
-      if(!ok)return; state={budget:num(s.budget),suppliers:s.suppliers,items:s.items}; $("budget").value=state.budget||0; fillRoomFilter(); renderCurrent(); updateTotals(); touch(); toast("Backup restored");
+      if(!ok)return; state=normalize(s); $("budget").value=state.budget||0; fillRoomFilter(); renderCurrent(); updateTotals(); touch(); toast("Backup restored");
     });
   };
   r.readAsText(f); inp.value="";
 });
 
-fillRoomFilter(); renderPlanner(); updateTotals(); setStatus("","Loading…");
+fillRoomFilter(); refreshCatalogList(); renderPlanner(); updateTotals(); setStatus("","Loading…");
 
 if(PIN){load(true);}else{showLock("");setStatus("","Locked");}
 })();
